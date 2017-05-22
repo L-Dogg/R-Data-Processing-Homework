@@ -1,0 +1,437 @@
+---
+title: "<p class='title'>Praca domowa 3 - testy poprawności knn()</p>"
+author: "<p class='title'>Szymon Adach</p>"
+date: "<p class='title'>20. Kwietnia, 2017</p>"
+output: 
+  html_document:
+    number_sections: true
+---
+
+<style>
+  .title {
+    text-align: center;
+    fontsize: 150%;
+  }
+</style>
+
+Referencyjna funkcja ma postać:
+```{r comparison}
+knn_do_porownan <- function(X, y, Z, k, p=2) {
+    # działa tylko dla "małych" p
+    stopifnot(p <= 10)
+    moda <- function(u) {
+        ut <- table(u)
+        ut <- ut[ut == max(ut)]
+        if (length(ut) == 1) names(ut[1])
+        else names(ut[sample(length(ut), 1)])
+        # tu jest if, bo sample(jedna_wartosc) dziala inaczej niz chcemy
+    }
+
+    # porównaj tę implementację ze swoją
+    X <- t(X)
+    Z <- t(Z)
+    yc <- as.character(y)
+    r <- sapply(1:ncol(Z), function(i) {
+        d <- colSums(abs(X-Z[,i])^p) # odleglosci (bez pierwiastka stopnia p) - Z[,i] vs kazdy z X
+        moda(yc[order(d)[1:k]])
+    })
+    factor(r, levels=levels(y)) # zachowujemy zgodnosc z oryginalnym czynnikiem y
+}
+```
+```{r echo=FALSE}
+library(Rcpp);
+Sys.setenv("PKG_CXXFLAGS"="-std=c++11")
+sourceCpp("knn.cpp")
+```
+
+Ze względu na wykorzystanie losowości w przypadku, gdy jest kilka wartości-kandydatów do miana dominanty, mogą wystąpić rozbieżności pomiędzy wynikami referencyjnej funkcji oraz funkcji `knn()`.
+Zbiory do testów zamieszczone są na stronie [gagolewski.com](http://www.gagolewski.com/resources/data/ordinal-regression/) w postaci plików csv. Wykorzystałem zestawy:
+
+* abalone
+* skill
+* glass
+
+# Abalone
+
+## k = 1, p = 2
+Zbiór uczący i testowy są takie same - w tym przypadku dla $k=1$ nie powinny występować rozbieżności między etykietami wejściowymi a obliczonymi (wyjątkowo zbiory są z $\mathbb{R}^n$).
+```{r echo=FALSE}
+d <- as.matrix(read.csv("http://www.gagolewski.com/resources/data/ordinal-regression/abalone.csv", sep = ","))
+y <- factor(d[,1])
+X <- d[, 2:ncol(d)]
+```
+Funkcja referencyjna:
+```{r}
+f1 <- knn_do_porownan(X, y, X, 1, 2)
+head(f1, n=100)
+```
+```{r echo=FALSE}
+f1 <- as.numeric(levels(f1))[f1] - as.vector(d[,1])
+```
+Liczba różnic pomiędzy wynikiem $w$ a poprawnymi etykietami $y$ wynosi `r length(f1[f1 != 0])`.
+
+Własna implementacja: 
+```{r}
+f2 <- knn(X, y, X, 1, 2)
+head(f2, n=100)
+```
+```{r echo=FALSE}
+f2 <- as.numeric(levels(f2))[f2] - as.vector(d[,1])
+diff <- sum(as.numeric(levels(f2))[f2] != as.numeric(levels(f1))[f1])
+```
+Liczba różnic pomiędzy wynikiem $w$ a poprawnymi etykietami $y$ wynosi `r length(f2[f2 != 0])`.
+
+<p class='title'> Czy wyniki funkcji są takie same: `r identical(f1, f2)`</p>
+<p class='title'> Wyniki funkcji różnią się na `r diff` pozycjach (`r diff/length(f1)*100`% całości) </p>
+
+## k = 3, p = 7
+```{r echo=FALSE}
+ind <- sample(1:nrow(X), 100)
+Z <- X[ind, 2:3]
+X1 <- X[-ind, 2:3]
+```
+Funkcja referencyjna:
+```{r}
+f1 <- knn_do_porownan(X1, y, Z, 3, 7)
+f1
+```
+```{r echo=FALSE}
+labels1 <- f1
+q <- as.numeric(levels(f1))[f1] - as.vector(d[ind,1])
+```
+```{r echo=FALSE, fig.align='center'}
+plot(dim1 ~ dim2,
+     pch = seq(15, 14 + length(levels(labels1)), by = 1)[as.numeric(labels1)],
+     main = "Punkty i ich etykiety",
+     col = c("red", "green", "skyblue", "orange", "limegreen")[as.numeric(labels1)],
+     data = data.frame(dim1 = X[ind, 2], dim2 = X[ind, 3], labels = labels1),
+     ylab='', xlab='')
+```
+
+Własna implementacja: 
+```{r}
+f2 <- knn(X1, y, Z, 3, 7)
+f2
+```
+```{r echo=FALSE}
+labels2 <- f2
+q <- as.numeric(levels(f2))[f2] - as.vector(d[ind,1])
+diff <- sum(as.numeric(levels(f2))[f2] != as.numeric(levels(f1))[f1])
+```
+
+<p class='title'> Czy wyniki funkcji są takie same: `r identical(f1, f2)`</p>
+<p class='title'> Wyniki funkcji różnią się na `r diff` pozycjach (`r diff/length(f1)*100`% całości) </p>
+
+```{r echo=FALSE, fig.align='center'}
+plot(dim1 ~ dim2,
+     pch = seq(15, 14 + length(levels(labels2)), by = 1)[as.numeric(labels2)],
+     main = "Punkty i ich etykiety",
+     col = c("red", "green", "skyblue", "orange", "limegreen")[as.numeric(labels2)],
+     data = data.frame(dim1 = X[ind, 2], dim2 = X[ind, 3], labels = labels2),
+     ylab='', xlab='')
+```
+
+## k = 9, p = 9
+```{r echo=FALSE}
+ind <- sample(1:nrow(X), 70)
+Z <- X[ind, 2:3]
+X1 <- X[-ind, 2:3]
+```
+Funkcja referencyjna:
+```{r}
+f1 <- knn_do_porownan(X1, y, Z, 9, 9)
+f1
+```
+```{r echo=FALSE}
+labels1 <- f1
+q <- as.numeric(levels(f1))[f1] - as.vector(d[ind,1])
+```
+```{r echo=FALSE, fig.align='center'}
+plot(dim1 ~ dim2,
+     pch = seq(15, 14 + length(levels(labels1)), by = 1)[as.numeric(labels1)],
+     main = "Punkty i ich etykiety",
+     col = c("red", "green", "skyblue", "orange", "limegreen")[as.numeric(labels1)],
+     data = data.frame(dim1 = X[ind, 2], dim2 = X[ind, 3], labels = labels1),
+     ylab='', xlab='')
+```
+
+
+Własna implementacja: 
+```{r}
+f2 <- knn(X1, y, Z, 9, 9)
+f2
+```
+```{r echo=FALSE}
+labels2 <- f2
+q <- as.numeric(levels(f2))[f2] - as.vector(d[ind,1])
+diff <- sum(as.numeric(levels(f2))[f2] != as.numeric(levels(f1))[f1])
+```
+
+```{r echo=FALSE, fig.align='center'}
+plot(dim1 ~ dim2,
+     pch = seq(15, 14 + length(levels(labels2)), by = 1)[as.numeric(labels2)],
+     main = "Punkty i ich etykiety",
+     col = c("red", "green", "skyblue", "orange", "limegreen")[as.numeric(labels2)],
+     data = data.frame(dim1 = X[ind, 2], dim2 = X[ind, 3], labels = labels2),
+     ylab='', xlab='')
+```
+
+<p class='title'> Czy wyniki funkcji są takie same: `r identical(f1, f2)`</p>
+<p class='title'> Wyniki funkcji różnią się na `r diff` pozycjach (`r diff/length(f1)*100`% całości) </p>
+
+# Skill
+
+## k = 1, p = 2
+Zbiór uczący i testowy są takie same - w tym przypadku dla $k=1$ nie powinny występować rozbieżności między etykietami wejściowymi a obliczonymi (wyjątkowo zbiory są z $\mathbb{R}^n$).
+```{r echo=FALSE}
+d <- as.matrix(read.csv("http://www.gagolewski.com/resources/data/ordinal-regression/skill.csv", sep = ","))
+y <- factor(d[,1])
+X <- d[, 2:ncol(d)]
+```
+Funkcja referencyjna:
+```{r}
+f1 <- knn_do_porownan(X, y, X, 1, 2)
+head(f1, n=100)
+```
+```{r echo=FALSE}
+f1 <- as.numeric(levels(f1))[f1] - as.vector(d[,1])
+```
+Liczba różnic pomiędzy wynikiem $w$ a poprawnymi etykietami $y$ wynosi `r length(f1[f1 != 0])`.
+
+Własna implementacja: 
+```{r}
+f2 <- knn(X, y, X, 1, 2)
+head(f2, n=100)
+```
+```{r echo=FALSE}
+f2 <- as.numeric(levels(f2))[f2] - as.vector(d[,1])
+diff <- sum(as.numeric(levels(f2))[f2] != as.numeric(levels(f1))[f1])
+```
+Liczba różnic pomiędzy wynikiem $w$ a poprawnymi etykietami $y$ wynosi `r length(f2[f2 != 0])`.
+
+<p class='title'> Czy wyniki funkcji są takie same: `r identical(f1, f2)`</p>
+<p class='title'> Wyniki funkcji różnią się na `r diff` pozycjach (`r diff/length(f1)*100`% całości) </p>
+
+## k = 3, p = 7
+```{r echo=FALSE}
+ind <- sample(1:nrow(X), 100)
+Z <- X[ind, 2:3]
+X1 <- X[-ind, 2:3]
+```
+Funkcja referencyjna:
+```{r}
+f1 <- knn_do_porownan(X1, y, Z, 3, 7)
+f1
+```
+```{r echo=FALSE}
+labels1 <- f1
+q <- as.numeric(levels(f1))[f1] - as.vector(d[ind,1])
+```
+```{r echo=FALSE, fig.align='center'}
+plot(dim1 ~ dim2,
+     pch = seq(15, 14 + length(levels(labels1)), by = 1)[as.numeric(labels1)],
+     main = "Punkty i ich etykiety",
+     col = c("red", "green", "skyblue", "orange", "limegreen")[as.numeric(labels1)],
+     data = data.frame(dim1 = X[ind, 2], dim2 = X[ind, 3], labels = labels1),
+     ylab='', xlab='')
+```
+
+
+Własna implementacja: 
+```{r}
+f2 <- knn(X1, y, Z, 3, 7)
+f2
+```
+```{r echo=FALSE}
+labels2 <- f2
+q <- as.numeric(levels(f2))[f2] - as.vector(d[ind,1])
+diff <- sum(as.numeric(levels(f2))[f2] != as.numeric(levels(f1))[f1])
+```
+
+```{r echo=FALSE, fig.align='center'}
+plot(dim1 ~ dim2,
+     pch = seq(15, 14 + length(levels(labels2)), by = 1)[as.numeric(labels2)],
+     main = "Punkty i ich etykiety",
+     col = c("red", "green", "skyblue", "orange", "limegreen")[as.numeric(labels2)],
+     data = data.frame(dim1 = X[ind, 2], dim2 = X[ind, 3], labels = labels2),
+     ylab='', xlab='')
+```
+
+<p class='title'> Czy wyniki funkcji są takie same: `r identical(f1, f2)`</p>
+<p class='title'> Wyniki funkcji różnią się na `r diff` pozycjach (`r diff/length(f1)*100`% całości) </p>
+
+## k = 9, p = 9
+```{r echo=FALSE}
+ind <- sample(1:nrow(X), 70)
+Z <- X[ind, 2:3]
+X1 <- X[-ind, 2:3]
+```
+Funkcja referencyjna:
+```{r}
+f1 <- knn_do_porownan(X1, y, Z, 9, 9)
+f1
+```
+```{r echo=FALSE}
+labels1 <- f1
+q <- as.numeric(levels(f1))[f1] - as.vector(d[ind,1])
+```
+```{r echo=FALSE, fig.align='center'}
+plot(dim1 ~ dim2,
+     pch = seq(15, 14 + length(levels(labels1)), by = 1)[as.numeric(labels1)],
+     main = "Punkty i ich etykiety",
+     col = c("red", "green", "skyblue", "orange", "limegreen")[as.numeric(labels1)],
+     data = data.frame(dim1 = X[ind, 2], dim2 = X[ind, 3], labels = labels1),
+     ylab='', xlab='')
+```
+
+Własna implementacja: 
+```{r}
+f2 <- knn(X1, y, Z, 9, 9)
+f2
+```
+```{r echo=FALSE}
+labels2 <- f2
+q <- as.numeric(levels(f2))[f2] - as.vector(d[ind,1])
+diff <- sum(as.numeric(levels(f2))[f2] != as.numeric(levels(f1))[f1])
+```
+```{r echo=FALSE, fig.align='center'}
+plot(dim1 ~ dim2,
+     pch = seq(15, 14 + length(levels(labels2)), by = 1)[as.numeric(labels2)],
+     main = "Punkty i ich etykiety",
+     col = c("red", "green", "skyblue", "orange", "limegreen")[as.numeric(labels2)],
+     data = data.frame(dim1 = X[ind, 2], dim2 = X[ind, 3], labels = labels2),
+     ylab='', xlab='')
+```
+
+
+<p class='title'> Czy wyniki funkcji są takie same: `r identical(f1, f2)`</p>
+<p class='title'> Wyniki funkcji różnią się na `r diff` pozycjach (`r diff/length(f1)*100`% całości) </p>
+
+# Glass
+
+## k = 1, p = 2
+Zbiór uczący i testowy są takie same - w tym przypadku dla $k=1$ nie powinny występować rozbieżności między etykietami wejściowymi a obliczonymi (wyjątkowo zbiory są z $\mathbb{R}^n$).
+```{r echo=FALSE}
+d <- as.matrix(read.csv("http://www.gagolewski.com/resources/data/ordinal-regression/glass.csv", sep = ","))
+y <- factor(d[,1])
+X <- d[, 2:ncol(d)]
+```
+Funkcja referencyjna:
+```{r}
+f1 <- knn_do_porownan(X, y, X, 1, 2)
+head(f1, n=100)
+```
+```{r echo=FALSE}
+f1 <- as.numeric(levels(f1))[f1] - as.vector(d[,1])
+```
+Liczba różnic pomiędzy wynikiem $w$ a poprawnymi etykietami $y$ wynosi `r length(f1[f1 != 0])`.
+
+Własna implementacja: 
+```{r}
+f2 <- knn(X, y, X, 1, 2)
+head(f2, n=100)
+```
+```{r echo=FALSE}
+f2 <- as.numeric(levels(f2))[f2] - as.vector(d[,1])
+diff <- sum(as.numeric(levels(f2))[f2] != as.numeric(levels(f1))[f1])
+```
+Liczba różnic pomiędzy wynikiem $w$ a poprawnymi etykietami $y$ wynosi `r length(f2[f2 != 0])`.
+
+<p class='title'> Czy wyniki funkcji są takie same: `r identical(f1, f2)`</p>
+<p class='title'> Wyniki funkcji różnią się na `r diff` pozycjach (`r diff/length(f1)*100`% całości) </p>
+
+## k = 3, p = 7
+```{r echo=FALSE}
+ind <- sample(1:nrow(X), 100)
+Z <- X[ind, 2:3]
+X1 <- X[-ind, 2:3]
+```
+Funkcja referencyjna:
+```{r}
+f1 <- knn_do_porownan(X1, y, Z, 3, 7)
+f1
+```
+```{r echo=FALSE}
+labels1 <- f1
+q <- as.numeric(levels(f1))[f1] - as.vector(d[ind,1])
+```
+```{r echo=FALSE, fig.align='center'}
+plot(dim1 ~ dim2,
+     pch = seq(15, 14 + length(levels(labels1)), by = 1)[as.numeric(labels1)],
+     main = "Punkty i ich etykiety",
+     col = c("red", "green", "skyblue", "orange", "limegreen")[as.numeric(labels1)],
+     data = data.frame(dim1 = X[ind, 2], dim2 = X[ind, 3], labels = labels1),
+     ylab='', xlab='')
+```
+
+
+Własna implementacja: 
+```{r}
+f2 <- knn(X1, y, Z, 3, 7)
+f2
+```
+```{r echo=FALSE}
+labels2 <- f2
+q <- as.numeric(levels(f2))[f2] - as.vector(d[ind,1])
+diff <- sum(as.numeric(levels(f2))[f2] != as.numeric(levels(f1))[f1])
+```
+```{r echo=FALSE, fig.align='center'}
+plot(dim1 ~ dim2,
+     pch = seq(15, 14 + length(levels(labels2)), by = 1)[as.numeric(labels2)],
+     main = "Punkty i ich etykiety",
+     col = c("red", "green", "skyblue", "orange", "limegreen")[as.numeric(labels2)],
+     data = data.frame(dim1 = X[ind, 2], dim2 = X[ind, 3], labels = labels2),
+     ylab='', xlab='')
+```
+
+
+<p class='title'> Czy wyniki funkcji są takie same: `r identical(f1, f2)`</p>
+<p class='title'> Wyniki funkcji różnią się na `r diff` pozycjach (`r diff/length(f1)*100`% całości) </p>
+
+## k = 9, p = 9
+```{r echo=FALSE}
+ind <- sample(1:nrow(X), 70)
+Z <- X[ind, 2:3]
+X1 <- X[-ind, 2:3]
+```
+Funkcja referencyjna:
+```{r}
+f1 <- knn_do_porownan(X1, y, Z, 9, 9)
+f1
+```
+```{r echo=FALSE}
+labels1 <- f1
+q <- as.numeric(levels(f1))[f1] - as.vector(d[ind,1])
+```
+```{r echo=FALSE, fig.align='center'}
+plot(dim1 ~ dim2,
+     pch = seq(15, 14 + length(levels(labels1)), by = 1)[as.numeric(labels1)],
+     main = "Punkty i ich etykiety",
+     col = c("red", "green", "skyblue", "orange", "limegreen")[as.numeric(labels1)],
+     data = data.frame(dim1 = X[ind, 2], dim2 = X[ind, 3], labels = labels1),
+     ylab='', xlab='')
+```
+
+
+Własna implementacja: 
+```{r}
+f2 <- knn(X1, y, Z, 9, 9)
+f2
+```
+```{r echo=FALSE}
+labels2 <- f2
+q <- as.numeric(levels(f2))[f2] - as.vector(d[ind,1])
+diff <- sum(as.numeric(levels(f2))[f2] != as.numeric(levels(f1))[f1])
+```
+```{r echo=FALSE, fig.align='center'}
+plot(dim1 ~ dim2,
+     pch = seq(15, 14 + length(levels(labels2)), by = 1)[as.numeric(labels2)],
+     main = "Punkty i ich etykiety",
+     col = c("red", "green", "skyblue", "orange", "limegreen")[as.numeric(labels2)],
+     data = data.frame(dim1 = X[ind, 2], dim2 = X[ind, 3], labels = labels2),
+     ylab='', xlab='')
+```
+
+
+<p class='title'> Czy wyniki funkcji są takie same: `r identical(f1, f2)`</p>
+<p class='title'> Wyniki funkcji różnią się na `r diff` pozycjach (`r diff/length(f1)*100`% całości) </p>

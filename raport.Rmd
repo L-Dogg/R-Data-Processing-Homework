@@ -1,0 +1,1955 @@
+---
+title: "<p class='title'>Praca domowa 3</p>"
+author: "<p class='title'>Szymon Adach</p>"
+date: "<p class='title'>22 Kwietnia, 2017</p>"
+output: 
+  html_document:
+    number_sections: true
+    toc: true
+---
+
+<style>
+  .title {
+    text-align: center;
+    fontsize: 150%;
+  }
+</style>
+
+<center><b>
+Jeżeli wykresy nie są widoczne, to proszę otworzyć ten raport w innej przeglądarce, która obsługuje javascript (np. Google Chrome lub przeglądarka wbudowana w RStudio).
+</b></center>
+
+# Opis implementacji
+Funkcja w `Rcpp` przyjmuje jeden dodatkowy parametr - jest to flaga logiczna, która wskazuje, czy obliczana jest średnia z k sąsiadów, czy ich moda. Dla każdego elementu zbioru testowego obliczane są dystanse między nim, a elementami zbioru uczącego. Następnie zbieranych jest k indeksów najbliższych sąsiadów, których etykiety są następnie przetwarzane przez funkcje `calculateMean()` lub `moda()`.
+```{cpp}
+IntegerVector knn(NumericMatrix X, 
+                  IntegerVector y, 
+                  NumericMatrix Z, 
+                  int k, 
+                  double p = 2, 
+                  bool calculateMean = false)
+{
+  int m = Z.nrow();
+  IntegerVector w(m);
+  w.attr("levels") = y.attr("levels");
+  w.attr("class") = "factor";
+  
+  
+  for(int i = 0; i < m; i++)
+  {
+    NumericVector distances = calculateDistance(X, Z.row(i), p);
+    NumericVector indices = getNeighbourIndices(distances, k);
+    
+    IntegerVector classes(k);
+    for (int j = 0; j < k; j++)
+    {
+      classes[j] = y[indices[j]];
+    }
+    w[i] = calculateMean ? my_mean(classes) : moda_improved(classes);
+  }
+  
+  return w;
+}
+```
+Znajdowanie k najbliższych sąsiadów zaimplementowałem za pomocą kolejki priorytetowej, w której przechowywane są pary `<odległość, indeks_elementu>`. Aby pierwszym elementem kolejki (do którego mamy dostęp w czasie stałym) był element o **minimalnej** odległości, priorytety to ujemne odległości. N razy wykonywana jest operacja dodania elementu (złożoność zamortyzowana $\mathcal{O}(n\log{}n)$). Następnie k razy usuwamy z kolejki pierwszy element (złożoność $\mathcal{O}(1)$)
+```{cpp}
+NumericVector getNeighbourIndices(NumericVector distances, int k)
+{
+  std::priority_queue<std::pair<double, int> > q;
+  int n = distances.size();
+  for(int i = 0; i < n; i++)
+  {
+    q.push(std::pair<double, int>(-distances[i], i));
+  }
+  
+  NumericVector indices(k);
+  for(int i = 0; i < k; i++)
+  {
+    indices[i] = q.top().second;
+    q.pop();
+  }
+  
+  return indices;
+}
+```
+
+Moda jest obliczana za pomocą tablicy haszującej, zaimplementowanej w STL-u jako `std::unordered_map`. Dla każdego elementu z wektora wejściowego dodajemy go do tablicy lub inkrementujemy licznik, jeżeli taki element już istnieje w tablicy. Gdy jest kilka elementów najczęstszych, wartość dominanty jest spośród nich losowana.
+```{cpp}
+int moda_improved(IntegerVector c)
+{
+  // Count occurences:
+  std::unordered_map<int, int> occurences;
+  for (int i = 0; i < c.size(); i++)
+  {
+    auto search = occurences.find(c[i]);
+    if(search != occurences.end())
+      search->second++;
+    else
+      occurences.insert({c[i], 1});
+  }
+  // Get keys with highest values (numbers with most occurences):
+  std::vector<int> vals;
+  int max = 0;
+  for(const auto& n : occurences)
+  {
+    if (n.second > max)
+    {
+      max = n.second;
+      vals.clear();
+      vals.push_back(n.first);
+    }
+    else if(n.second == max)
+    {
+      vals.push_back(n.first);
+    }
+  }
+  // Draw a random index:
+  int ind = round(R::runif(0, 1) * vals.size());
+  
+  return vals[ind == vals.size() ? ind - 1 : ind];
+}
+```
+
+# Porównanie wyników 5-krotnej kroswalidacji: knn() i knn_do_porównań()
+Dowód poprawności implementacji funkcji `knn()` znajudje się w [osobnym raporcie](./testy.html). Rozbieżności wynikają z doboru losowej dominanty w przypadku, gdy jest kilka najczęstszych wartości. Ponadto referencyjna funkcja `knn_do_porównań()` nie obsługuje metryk o $p>10$.
+
+Należy zauważyć, że przy rosnącej liczbie rozważanych sąsiadów $k$ wspólną cechą poniższych wyników jest spadający (dla $p=1,2,\infty$) odsetek błędów $ERR$, a także zmniejszające się $MSE$ i $MAD$ (wyjątkiem jest nietypowy zbiór glass).
+
+**UWAGA!** Wszystkie wykresy w tym rozdziale (oraz część wykresów w kolejnych rozdziałach) wykorzystują bibliotekę `plotly`. Kliknięcie na którykolwiek element legendy zmienia widoczność odpowiedniego wykresu. Najechanie kursorem na punkt na wykresie powoduje wyświetlenie pary `<k, miara_błędu(k)>`. Na wykresy zostały naniesione przerywane linie łamane, których zadaniem jest wskazywać trend zmian miar błędów dla różnych k.
+
+## Abalone
+Jest to zbiór danych zawierający informacje o skorupiakach, tzw. abalonach. Na podstawie 7 cech, takich jak długość, wysokość czy waga, osobnikowi przypisywana jest etykieta - wiek. Warto zauważyć, że jest to stosunkowo mała liczba cech.
+
+### Metryka z p = 1
+
+```{r echo=FALSE}
+k <- c(1,3,5,7,9,11,13,15,17,19)
+p <- 1
+benchmark_results1 <- as.matrix(read.csv(paste("./abalone/p_", p, ".csv", sep=""), sep = ","))
+benchmark_results2 <- as.matrix(read.csv(paste("./abalone _knn_do_porownan/p_", p, ".csv", sep=""), sep = ","))
+
+rownames(benchmark_results1) <- k
+rownames(benchmark_results2) <- k
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,1], name = "ERR", mode = 'lines+markers',
+            line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn(), p=1", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Widoczna jest jednoznaczna tendencja spadkowa dla wszystkich miar błędu, szczególnie błędu średniokwadratowego, wraz z rosnącą wartością parametru $k$.
+
+Wyniki dla `knn_do_porownan()`:
+```{r}
+benchmark_results2
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,1], name = "ERR", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn_do_porownan(), p=1", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Wyniki funkcji referencyjnej są bardzo zbliżone do mojej implementacji, aczkolwiek można dostrzec anomalię dla błędu średniokwadratowego przy $k=3$, który niemal nie zmienił się w porównaniu z wartością dla $k=1$.
+
+### Metryka z p=2
+
+```{r echo=FALSE}
+k <- c(1,3,5,7,9,11,13,15,17,19)
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./abalone/p_", p, ".csv", sep=""), sep = ","))
+benchmark_results2 <- as.matrix(read.csv(paste("./abalone _knn_do_porownan/p_", p, ".csv", sep=""), sep = ","))
+
+rownames(benchmark_results1) <- k
+rownames(benchmark_results2) <- k
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,1], name = "ERR", mode = 'lines+markers',
+            line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn(), p=2", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Wyniki są zbliżone do tych z poprzedniego rozdziału ($p=1$). Wartość wskaźnika $ERR$ utrzymuje się na podobnym poziomie dla wszystkich rozpatrywanych $k$.
+
+Wyniki dla `knn_do_porownan()`:
+```{r}
+benchmark_results2
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,1], name = "ERR", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn_do_porownan(), p=2", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Również obserwowany jest trend malejących wraz ze wzrostem $k$ miar błędu. Nie zaobserwowano znaczących różnic między implementacjami w przypadku metryk z $p=2$.
+
+### Metryka z p=Inf
+
+```{r echo=FALSE}
+k <- c(1,3,5,7,9,11,13,15,17,19)
+p <- Inf
+benchmark_results1 <- as.matrix(read.csv("./abalone/p_Inf.csv", sep = ","))
+
+rownames(benchmark_results1) <- k
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,1], name = "ERR", mode = 'lines+markers',
+            line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn(), p=Inf", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+
+Obserwowany jest jednoznaczny trend malejących miar błędów $MSE$, $MAD$, stopa błędów $ERR$ pozostaje w przybliżeniu niezmieniona. Oznaczać to może, że przy podobnej liczbie błędów, przewidzane przez knn() etykiety są bliższe rzeczywistym etykietom dla większych $k$.
+
+`knn_do_porownan()` nie obsługuje metryk z $p > 10$, stąd brak porównania mojej implementacji z funkcją referencyjną.
+
+
+## Porównanie wpływu metryk
+
+Porównajmy jak zachowuje się metoda k-najbliższych sąsiadów w zbiorze abalone dla różnych metryk (ustalone $k=7$):
+
+```{r echo=FALSE}
+k <- 7
+p <- 1
+benchmark_results1 <- as.matrix(read.csv(paste("./abalone/p_", p, ".csv", sep=""), sep = ","))[4, ]
+p <- 2
+benchmark_results2 <- as.matrix(read.csv(paste("./abalone/p_", p, ".csv", sep=""), sep = ","))[4, ]
+benchmark_results3 <- as.matrix(read.csv("./abalone/p_Inf.csv", sep = ","))[4, ]
+```
+
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+p_1 <- benchmark_results1
+p_2 <-  benchmark_results2
+p_Inf <- benchmark_results2
+names(p_1) <- NULL
+names(p_2) <- NULL
+names(p_Inf) <- NULL
+data <- data.frame(measures, p_1, p_2, p_Inf)
+
+p <- config(plot_ly(data, x = ~measures, y = ~p_1, type = 'bar', name = 'p=1') %>%
+            add_trace(y = ~p_2, name = 'p=2') %>%
+            add_trace(y = ~p_Inf, name = 'p=inf') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, zbiór abalone, k=7",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Jak widać, różnice nie są duże, a najlepszą metryką okazała się $L_1$.
+
+## Kinematics
+Ten zbiór danych zawiera 8 zmiennych dotyczących położenia ramienia robota. Według źródła jest średnio zaszumiony, a dane są silnie nieliniowe.
+
+### Metryka z p = 1
+
+```{r echo=FALSE}
+k <- c(1,3,5,7,9,11,13,15,17,19)
+p <- 1
+benchmark_results1 <- as.matrix(read.csv(paste("./kinematics/p_", p, ".csv", sep=""), sep = ","))
+benchmark_results2 <- as.matrix(read.csv(paste("./kinematics _knn_do_porownan/p_", p, ".csv", sep=""), sep = ","))
+
+rownames(benchmark_results1) <- k
+rownames(benchmark_results2) <- k
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,1], name = "ERR", mode = 'lines+markers',
+            line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn(), p=1", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Oprócz zaburzenia obserwowanego dla $k=3$ i $k=19$ błędy maleją ze wzrostem k.
+
+Wyniki dla `knn_do_porownan()`:
+```{r}
+benchmark_results2
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,1], name = "ERR", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn_do_porownan(), p=1", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Nie są obserwowane odstępstwa od funkcji referencyjnej.
+
+### Metryka z p=2
+
+```{r echo=FALSE}
+k <- c(1,3,5,7,9,11,13,15,17,19)
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./kinematics/p_", p, ".csv", sep=""), sep = ","))
+benchmark_results2 <- as.matrix(read.csv(paste("./kinematics _knn_do_porownan/p_", p, ".csv", sep=""), sep = ","))
+
+rownames(benchmark_results1) <- k
+rownames(benchmark_results2) <- k
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,1], name = "ERR", mode = 'lines+markers',
+            line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn(), p=2", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Błędy utrzymują się na podobnym poziomie jak dla $p=1$, aczkolwiek obserwowane jest jedno zaburzenie trendu dla $MSE$ więcej (w punkcie $k=15$).
+
+Wyniki dla `knn_do_porownan()`:
+```{r}
+benchmark_results2
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,1], name = "ERR", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn_do_porownan(), p=2", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Wyniki funkcji referencyjnej są podobne, choć wskaźnik $MSE$ jest nieco wyższy. Ponadto  ekstremum lokalne dla $k=15$ jest mniej "wyeksponowane" niż w mojej implementacji.
+
+### Metryka z p=Inf
+
+```{r echo=FALSE}
+k <- c(1,3,5,7,9,11,13,15,17,19)
+p <- Inf
+benchmark_results1 <- as.matrix(read.csv("./kinematics/p_Inf.csv", sep = ","))
+
+rownames(benchmark_results1) <- k
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,1], name = "ERR", mode = 'lines+markers',
+            line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn(), p=Inf", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+
+W porównaniu z poprzednimi punktami, obserwowanych jest więcej zaburzeń w zmianach wskaźnika $MSE$, przy utrzymujęcej się na podobnym poziomie stopie błędów $ERR$.
+
+`knn_do_porownan()` nie obsługuje metryk z $p > 10$, stąd brak porównania mojej implementacji z funkcją referencyjną.
+
+## Porównanie wpływu metryk
+
+Porównajmy jak zachowuje się metoda k-najbliższych sąsiadów w zbiorze kinematics dla różnych metryk (ustalone $k=7$):
+
+```{r echo=FALSE}
+k <- 7
+p <- 1
+benchmark_results1 <- as.matrix(read.csv(paste("./kinematics/p_", p, ".csv", sep=""), sep = ","))[4, ]
+p <- 2
+benchmark_results2 <- as.matrix(read.csv(paste("./kinematics/p_", p, ".csv", sep=""), sep = ","))[4, ]
+benchmark_results3 <- as.matrix(read.csv("./kinematics/p_Inf.csv", sep = ","))[4, ]
+```
+
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+p_1 <- benchmark_results1
+p_2 <-  benchmark_results2
+p_Inf <- benchmark_results2
+names(p_1) <- NULL
+names(p_2) <- NULL
+names(p_Inf) <- NULL
+data <- data.frame(measures, p_1, p_2, p_Inf)
+
+p <- config(plot_ly(data, x = ~measures, y = ~p_1, type = 'bar', name = 'p=1') %>%
+            add_trace(y = ~p_2, name = 'p=2') %>%
+            add_trace(y = ~p_Inf, name = 'p=inf') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, zbiór kinematics, k=7",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Odsetek błędów na podobnym poziomie dla każdego rozważanego $p$, jednak metryka $L_1$ wyróżnia się kilka procent gorszymi błędami $MAD$ i $MSE$.
+
+## Glass
+Ten zbiór danych służył kryminologom do klasyfikacji szkła pozostawionego na miejscu zbrodni - może ono posłużyć jako dowód. Klasyfikacja odbywa się na podstawie 10 atrybutów, takich jak zawartość pierwiastków (Magnez, Aluminium czy Krzem) lub współczynnik załamania światła.
+
+### Metryka z p = 1
+
+```{r echo=FALSE}
+k <- c(1,3,5,7,9,11,13,15,17,19)
+p <- 1
+benchmark_results1 <- as.matrix(read.csv(paste("./glass/p_", p, ".csv", sep=""), sep = ","))
+benchmark_results2 <- as.matrix(read.csv(paste("./glass _knn_do_porownan/p_", p, ".csv", sep=""), sep = ","))
+
+rownames(benchmark_results1) <- k
+rownames(benchmark_results2) <- k
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,1], name = "ERR", mode = 'lines+markers',
+            line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn(), p=1", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+
+W porównaniu do powyżej rozważanych zbiorów danych, w glass obserwujemy zależność wzrastających miar błędów dla rosnących $k$, jednak wszystkie wskaźniki utrzymują się na znacznie niższym bezwzględnym poziomie. Obserwowane są znaczne skoki $MSE$ dla kolejnych $k$. Przyczyną takiego stanu rzeczy mogą być punkty o podobnych atrybutach, jednak różnych etykietach, co przy rozpatrywaniu wielu sąsiadów może przesądzać o niepoprawnym przewidzeniu etykiety.
+
+Wyniki dla `knn_do_porownan()`:
+```{r}
+benchmark_results2
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,1], name = "ERR", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn_do_porownan(), p=1", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Jedyne obserwowane odstępstwa to zależność $MSE$ oraz niewielki skok stopy błędu dla $k=11$.
+
+### Metryka z p=2
+
+```{r echo=FALSE}
+k <- c(1,3,5,7,9,11,13,15,17,19)
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./glass/p_", p, ".csv", sep=""), sep = ","))
+benchmark_results2 <- as.matrix(read.csv(paste("./glass _knn_do_porownan/p_", p, ".csv", sep=""), sep = ","))
+
+rownames(benchmark_results1) <- k
+rownames(benchmark_results2) <- k
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,1], name = "ERR", mode = 'lines+markers',
+            line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn(), p=2", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Również i w tym przypadku widoczny jest znacznie rosnący błąd średniokwadratowy, jednak zmiany $ERR$ i $MAD$ nie są tak znacznie. Łamane trendu są bardziej "wygładzone", przez co rozumiem mniej znacznych zmian wartości $MAD$ czy $MSE$ dla sąsiednich $k$.
+
+Wyniki dla `knn_do_porownan()`:
+```{r}
+benchmark_results2
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,1], name = "ERR", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn_do_porownan(), p=2", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Moja implementacja daje podobne wyniki do funkcji referencyjnej, która rownież daje słabsze przewidywania dla $k=11$.
+
+### Metryka z p=Inf
+
+```{r echo=FALSE}
+k <- c(1,3,5,7,9,11,13,15,17,19)
+p <- Inf
+benchmark_results1 <- as.matrix(read.csv("./glass/p_Inf.csv", sep = ","))
+
+rownames(benchmark_results1) <- k
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,1], name = "ERR", mode = 'lines+markers',
+            line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn(), p=Inf", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Dla metryki $p=\infty$ obserwowane są rosnące miary błędów, w sposób szczególnie widoczny dla zakresu $k=1,3,5$.
+
+`knn_do_porownan()` nie obsługuje metryk z $p > 10$, stąd brak porównania mojej implementacji z funkcją referencyjną.
+
+## Porównanie wpływu metryk
+
+Porównajmy jak zachowuje się metoda k-najbliższych sąsiadów w zbiorze glass dla różnych metryk (ustalone $k=13$):
+
+```{r echo=FALSE}
+k <- 13
+p <- 1
+benchmark_results1 <- as.matrix(read.csv(paste("./glass/p_", p, ".csv", sep=""), sep = ","))[7, ]
+p <- 2
+benchmark_results2 <- as.matrix(read.csv(paste("./glass/p_", p, ".csv", sep=""), sep = ","))[7, ]
+benchmark_results3 <- as.matrix(read.csv("./glass/p_Inf.csv", sep = ","))[7, ]
+```
+
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+p_1 <- benchmark_results1
+p_2 <-  benchmark_results2
+p_Inf <- benchmark_results2
+names(p_1) <- NULL
+names(p_2) <- NULL
+names(p_Inf) <- NULL
+data <- data.frame(measures, p_1, p_2, p_Inf)
+
+p <- config(plot_ly(data, x = ~measures, y = ~p_1, type = 'bar', name = 'p=1') %>%
+            add_trace(y = ~p_2, name = 'p=2') %>%
+            add_trace(y = ~p_Inf, name = 'p=inf') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, zbiór glass, k=13",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Różnice w odsetku błędów są pomijalne. Pozostałe miary błędów wskazują na korzyść metryki z $p=1$ (ok. 9% różnicy).
+
+## Skill
+Na podstawie informacji o graczu Starcraft 2 (od wieku czy przegranych tygodniowo godzin po liczbę poszczególnych akcjach w jednostce czasu) naukowcy za pomocą algorytmów klasyfikacji obliczali do jakiej ligi powinien on należeć. Atrybutów wejściowych jest stosunkowo dużo, bo aż 18. Taka ich liczba może powodować tzw. "curse of dimensionality", czyli sytuację, gdy odległość euklidesowa nie przydaje się do obliczania odległości między wektorami ze zbioru uczącego, a wektorem ze zbioru testowego, ponieważ są one w przybliżeniu równoodległe.
+
+### Metryka z p = 1
+
+```{r echo=FALSE}
+k <- c(1,3,5,7,9,11,13,15,17,19)
+p <- 1
+benchmark_results1 <- as.matrix(read.csv(paste("./skill/p_", p, ".csv", sep=""), sep = ","))
+benchmark_results2 <- as.matrix(read.csv(paste("./skill _knn_do_porownan/p_", p, ".csv", sep=""), sep = ","))
+
+rownames(benchmark_results1) <- k
+rownames(benchmark_results2) <- k
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,1], name = "ERR", mode = 'lines+markers',
+            line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn(), p=1", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Im większa liczba rozpatrywanych sądiadów, tym mniejsze miary błędów. O ile wskaźnik $ERR$ dla $k\geq5$ utrzymuje się na podobnym poziomie, to maleje błąd średniokwadratowy i bezwzględny. Oznacza to, że przy podobnej liczbie popełnianych pomyłek, przewidywane etykiety są znacznie bliższe prawdziwym wartościom.
+
+Wyniki dla `knn_do_porownan()`:
+```{r}
+benchmark_results2
+```
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,1], name = "ERR", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn_do_porownan(), p=1", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Charakterystycznym punktem jest $k=5$, kiedy wszystkie wskaźniki gwałtowanie spadają. Dla $k>5$ obserwowany jest trend malejący dla $MSE$, pozostałe miary błędu utrzymują się na podobnym poziomie.
+
+### Metryka z p=2
+
+```{r echo=FALSE}
+k <- c(1,3,5,7,9,11,13,15,17,19)
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./skill/p_", p, ".csv", sep=""), sep = ","))
+benchmark_results2 <- as.matrix(read.csv(paste("./skill _knn_do_porownan/p_", p, ".csv", sep=""), sep = ","))
+
+rownames(benchmark_results1) <- k
+rownames(benchmark_results2) <- k
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,1], name = "ERR", mode = 'lines+markers',
+            line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn(), p=2", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Występuje znaczący spadek błędu średniokwadratowego przy wzroście $k$ z 3 na 5. $MAD$ utrzymuje się od $k=9$ na podobnym poziomie, podobnie jak $ERR$.
+
+Wyniki dla `knn_do_porownan()`:
+```{r}
+benchmark_results2
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,1], name = "ERR", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results2[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn_do_porownan(), p=2", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Obserwowany jest jednoznaczny trend malejący dla $MSE$. Również pozostałe wskaźniki maleją, jednak nie w tak widoczny sposób.
+
+### Metryka z p=Inf
+
+```{r echo=FALSE}
+k <- c(1,3,5,7,9,11,13,15,17,19)
+p <- Inf
+benchmark_results1 <- as.matrix(read.csv("./skill/p_Inf.csv", sep = ","))
+
+rownames(benchmark_results1) <- k
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+
+
+<center>
+```{r echo = FALSE, fig.align='center', message=FALSE, warning=FALSE}
+library("plotly")
+ay <- list(
+  tickfont = list(color = "green"),
+  overlaying = "y",
+  side = "right",
+  title = "MSE"
+) 
+p <- config(plot_ly() %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,1], name = "ERR", mode = 'lines+markers',
+            line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,2], name = "MAD", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  add_trace(x = ~k, y = ~benchmark_results1[,3], name = "MSE", yaxis = "y2", mode = 'lines+markers',             line = list(width = 0.45,dash='dot')) %>%
+  layout(
+    title = "Miary błędów klasyfikacji knn(), p=Inf", yaxis2 = ay,
+    xaxis = list(title="k"),
+    yaxis = list(title="ERR, MAD")
+  ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Możem zaobserwować spadające miary błędów, choć dla $ERR$ widoczne są niewielkie zaburzenia w trendzie ($k=9, 13$).
+
+`knn_do_porownan()` nie obsługuje metryk z $p > 10$, stąd brak porównania mojej implementacji z funkcją referencyjną.
+
+
+## Porównanie wpływu metryk
+
+Porównajmy jak zachowuje się metoda k-najbliższych sąsiadów w zbiorze skill dla różnych metryk (ustalone $k=9$):
+
+```{r echo=FALSE}
+k <- 9
+p <- 1
+benchmark_results1 <- as.matrix(read.csv(paste("./skill/p_", p, ".csv", sep=""), sep = ","))[5, ]
+p <- 2
+benchmark_results2 <- as.matrix(read.csv(paste("./skill/p_", p, ".csv", sep=""), sep = ","))[5, ]
+benchmark_results3 <- as.matrix(read.csv("./skill/p_Inf.csv", sep = ","))[5, ]
+```
+
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+p_1 <- benchmark_results1
+p_2 <-  benchmark_results2
+p_Inf <- benchmark_results2
+names(p_1) <- NULL
+names(p_2) <- NULL
+names(p_Inf) <- NULL
+data <- data.frame(measures, p_1, p_2, p_Inf)
+
+p <- config(plot_ly(data, x = ~measures, y = ~p_1, type = 'bar', name = 'p=1') %>%
+            add_trace(y = ~p_2, name = 'p=2') %>%
+            add_trace(y = ~p_Inf, name = 'p=inf') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, zbiór skill, k=9",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Metryka $L_1$ wyróżnia się nieco niższą miarą $ERR$ i błędem średniokwadratowym niższym o kilka procent.
+
+## Średnie wyniki knn
+Na podstawie powyższych metod można sprawdzić uśrednione wyniki metody knn:
+
+```{r echo=FALSE}
+general_results <- as.matrix(read.csv("./knnMean.csv", sep = ","))
+```
+```{r}
+general_results
+```
+
+<center>
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+data <- general_results[1,]
+names(data) <- NULL
+
+p <- config(plot_ly(x = measures, y = data, name = 'Średnie błędy knn') %>%
+            layout(
+              yaxis = list(title = 'Wartość'),
+              title = "Średnie miary błędów klasyfikacji",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+# Porownanie knn() i knn() z baggingiem
+Bagging jest techniką używaną w celu poprawienia stabilności i dokładności algorytmów klasyfikacji statystycznej. Redukuje ona wariancję i zapobiega tzw. overfittingowi (inaczej nadmiernemu dopasowaniu), czyli sytuacji, gdy model zaczyna dopasowywać się do przypadkowych błędów w danych uczących i zanika zdolność generalizacji. Z drugiej strony, bagging może obniżyć wydajnosć stabilnych metod, w tym algorytmu k-najbliższych sąsiadów.
+
+```{r}
+bagging <- function(X, y, Z, k, p, n=100) 
+{
+  # n - liczba podzbiorów
+  m <- nrow(X)
+  cols <- ncol(X)
+  # minimalny rozmiar podzbioru to k, żeby można było znaleźć k sąsiadów
+  subset_sizes <- runif(n, k, m)
+  
+  indices <- sample(1:m, subset_sizes[1], replace = TRUE)
+  w <- knn(matrix(X[indices, ], ncol=cols), y[indices], Z, k, p)
+  vals <- matrix(w, nrow=1)
+  
+  if (n > 1)
+  {
+    for(i in 2:n)
+    {
+      indices <- sample(1:m, subset_sizes[i], replace = TRUE)
+      w <- knn(matrix(X[indices, ], ncol=cols), y[indices], Z, k, p)
+      vals <- rbind(vals, w)
+    }
+  }
+  
+  vals <- sapply(1:ncol(vals), function(x) {moda(vals[,x])})
+  names(vals) <- NULL
+  factor(as.integer(vals), levels=levels(y))
+}
+```
+Zgodnie z algorytmem, losowane są podzbiory $X_i$ zbioru treningowego $X$ (wartości losowane ze zwracaniem). Następnie dla każdego z nich wywoływana jest funkcja `knn()`, a z tak otrzymanch wartości liczone są dominanty etykiet dla każdego elementu ze zbioru testowego.
+Odstępstwem od znalezionego na wikipedii algorytmu baggingu jest różny rozmiar podzbiorów, jednak taka modyfikacja daje zdecydowanie lepsze wyniki, więc postanowiłem umieścić ją w raporcie.
+
+**UWAGA** Poniższa analiza dotyczy przypadku algorytmu knn() z metryką dla $p=2$ oraz $k=2$.
+
+**UWAGA** Na każdy słupek wykresu można najechać kursorem, co powoduje wyświetlenie dokładnych wartości danej miary błędu w grupie.
+
+## Abalone
+
+```{r echo=FALSE}
+k <- 2
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./abalone/p_", p, ".csv", sep=""), sep = ","))[k, ]
+benchmark_results2 <- as.matrix(read.csv("./abalone_bagging_p2_k2/knn_bagging_p2k2.csv", sep = ","))
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `knn()` z baggingiem:
+```{r}
+benchmark_results2
+```
+
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bagging <-  benchmark_results2[1,]
+names(normal) <- NULL
+names(bagging) <- NULL
+data <- data.frame(measures, normal, bagging)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = "bar", name = 'Zwykły algorytm knn') %>%
+            add_trace(y = ~bagging, name = 'Knn z baggingiem') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, p=2, k=2",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Widoczna jest przewaga algorytmu z baggingiem, sięgająca ok. 6% dla wskaźnika $MSE$.
+
+## Kinematics
+
+```{r echo=FALSE}
+k <- 2
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./kinematics/p_", p, ".csv", sep=""), sep = ","))[k, ]
+benchmark_results2 <- as.matrix(read.csv("./kinematics_bagging_p2_k2/knn_bagging_p2k2.csv", sep = ","))
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `knn()` z baggingiem:
+```{r}
+benchmark_results2
+```
+
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bagging <-  benchmark_results2[1,]
+names(normal) <- NULL
+names(bagging) <- NULL
+data <- data.frame(measures, normal, bagging)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'Zwykły algorytm knn') %>%
+            add_trace(y = ~bagging, name = 'Knn z baggingiem') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, p=2, k=2",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Również w tym przypadku lepszy okazał się zmodyfikowany algorytm knn(). Ma on około 3% niższą stopę błędów $ERR$ oraz ok. 10% niższy błąd średniokwadratowy.
+
+## Glass
+
+```{r echo=FALSE}
+k <- 2
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./glass/p_", p, ".csv", sep=""), sep = ","))[k, ]
+benchmark_results2 <- as.matrix(read.csv("./glass_bagging_p2_k2/knn_bagging_p2k2.csv", sep = ","))
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `knn()` z baggingiem:
+```{r}
+benchmark_results2
+```
+
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bagging <-  benchmark_results2[1,]
+names(normal) <- NULL
+names(bagging) <- NULL
+data <- data.frame(measures, normal, bagging)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'Zwykły algorytm knn') %>%
+            add_trace(y = ~bagging, name = 'Knn z baggingiem') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, p=2, k=2",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+W tym przypadku wskaźniki $ERR$ i $MAD$ kształtują się na podobnym poziomie, ale widoczna jest różnica na korzyść baggingu na podstawie błędu średniokwadratowego, wyższego o ok. 4% dla niezmodyfikowanego knn.
+
+## Skill
+
+```{r echo=FALSE}
+k <- 2
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./skill/p_", p, ".csv", sep=""), sep = ","))[k, ]
+benchmark_results2 <- as.matrix(read.csv("./skill_bagging_p2_k2/knn_bagging_p2k2.csv", sep = ","))
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `knn()` z baggingiem:
+```{r}
+benchmark_results2
+```
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bagging <-  benchmark_results2[1,]
+names(normal) <- NULL
+names(bagging) <- NULL
+data <- data.frame(measures, normal, bagging)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'Zwykły algorytm knn') %>%
+            add_trace(y = ~bagging, name = 'Knn z baggingiem') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, p=2, k=2",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Jak w każdym z powyższych zbiorów, tak dla skill możemy zaobserwować znaczne korzyści wynikające z zastosowania baggingu - $MSE$ w tym przypadku jest mniejszy o ok 10%. Zatem dla zaszumionych danych boostrap aggregating rzeczywiście zapobiega overfittingowi.
+
+# Porownanie knn() z modą i knn() z wartością średnią
+W tym rozdziale prezentowana jest różnica między algorytmem knn, który wykorzystuje dominantę do wyznaczenia etykiety dla danego elementu zbioru testowego, a algorytmem knn, który działa w oparciu o obliczenie średniej arytmetycznej z etykiet k sąsiadów. Jedyna modyfikacja kodu podstawowego algorytmu knn w Rcpp to, zgodnie z powyższym opisem:
+```{cpp}
+w[i] = calculateMean ? my_mean(classes) : moda_improved(classes);
+```
+
+## Abalone (mała liczba cech)
+
+```{r echo=FALSE}
+k <- 5
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./abalone/p_", p, ".csv", sep=""), sep = ","))[3, ]
+benchmark_results2 <- as.matrix(read.csv(paste("./abalone_mean/p_", p, ".csv", sep=""), sep = ","))[3,]
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `knn()` ze średnią zamiast mody:
+```{r}
+benchmark_results2
+```
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bagging <-  benchmark_results2
+names(normal) <- NULL
+names(bagging) <- NULL
+data <- data.frame(measures, normal, bagging)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'Knn z modą') %>%
+            add_trace(y = ~bagging, name = 'Knn ze średnią') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, p=2, k=5",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Choć odsetek błędów dla metody ze średnią jest wyższy, to pozostałe miary (wykorzystujące odległości między przewidzianymi przez funkcję etykietami a rzeczywistymi wartościami) przemiawają na korzyść uśredniania. Jeżeli bliscy sąsiedzi mają znacząco różne etykiety, to pomyłki metody ze średnią są mniej "grube".
+
+## Kinematics (mała liczba cech)
+
+```{r echo=FALSE}
+k <- 5
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./kinematics/p_", p, ".csv", sep=""), sep = ","))[3, ]
+benchmark_results2 <- as.matrix(read.csv(paste("./kinematics_mean/p_", p, ".csv", sep=""), sep = ","))[3, ]
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `knn()` ze średnią zamiast mody:
+```{r}
+benchmark_results2
+```
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bagging <-  benchmark_results2
+names(normal) <- NULL
+names(bagging) <- NULL
+data <- data.frame(measures, normal, bagging)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'Knn z modą') %>%
+            add_trace(y = ~bagging, name = 'Knn ze średnią') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, p=2, k=5",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+W każdym ze wskaźników wygrywa metoda z uśrednianiem, dla której $MSE$ jest niższy o ok. 40%.
+
+## Glass (umiarkowana liczba cech)
+
+```{r echo=FALSE}
+k <- 7
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./glass/p_", p, ".csv", sep=""), sep = ","))[4, ]
+benchmark_results2 <- as.matrix(read.csv(paste("./glass_mean/p_", p, ".csv", sep=""), sep = ","))[4,]
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `knn()` ze średnią zamiast mody:
+```{r}
+benchmark_results2
+```
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bagging <-  benchmark_results2
+names(normal) <- NULL
+names(bagging) <- NULL
+data <- data.frame(measures, normal, bagging)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'Knn z modą') %>%
+            add_trace(y = ~bagging, name = 'Knn ze średnią') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, p=2, k=7",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Metoda knn() z dominantą etykiet sądiadów popełnia widocznie mniej błędów, jednak jej pomyłki są poważniejsze niż metody ze średnią.
+
+## Skill (duża liczba cech)
+
+```{r echo=FALSE}
+k <- 15
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./skill/p_", p, ".csv", sep=""), sep = ","))[8, ]
+benchmark_results2 <- as.matrix(read.csv(paste("./skill_mean/p_", p, ".csv", sep=""), sep = ","))[8, ]
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `knn()` ze średnią zamiast mody:
+```{r}
+benchmark_results2
+```
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bagging <-  benchmark_results2
+names(normal) <- NULL
+names(bagging) <- NULL
+data <- data.frame(measures, normal, bagging)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'Knn z modą') %>%
+            add_trace(y = ~bagging, name = 'Knn ze średnią') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, p=2, k=15",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+
+Liczba pomyłek kształtuje się na podobnym poziomie ~63%, jednak metoda z modą przydziela elementom etykiety znacząco różne od poprawnych wartości.
+
+# Porownanie knn() i knn() dla znormalizowanych danych
+Dane benchmarkowe są wystandaryzowane, co oznacza, że "od kazdej kolumny zbioru $X$ odejmujemy jej średnią arytmetyczną, a następnie dzielimy przez odchylenie standardowe". Tak zmodyfikowany zbiór otrzymuję w wyniku wywołania funkcji bazowej `scale(X)`. Dzięki temu kolumny mają zerową średnią i jednostkową wariancję. Dla danych nieznormalizowanych, w przypadku gdy jedna cecha ma duży rozrzut wartości, będzie miała ona decydujący wpływ na wynikową etykietę. Po normalizacji wszystkie atrybuty mają mniej więcej proporcjonalny wkład przy obliczaniu odległości, a więc również do wynikowej etykiety rozważanego elementu zbioru $Z$.
+
+## Abalone (mała liczba cech)
+
+```{r echo=FALSE}
+k <- 5
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./abalone/p_", p, ".csv", sep=""), sep = ","))[3, ]
+benchmark_results2 <- as.matrix(read.csv(paste("./abalone_standarized_data/p_", p, ".csv", sep=""), sep = ","))[3,]
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `knn()` z ustandaryzowanymi danymi:
+```{r}
+benchmark_results2
+```
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bagging <-  benchmark_results2
+names(normal) <- NULL
+names(bagging) <- NULL
+data <- data.frame(measures, normal, bagging)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'Zwykły algorytm knn') %>%
+            add_trace(y = ~bagging, name = 'Knn po standaryzacji zbioru X') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, p=2, k=5",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Zaobserwować można negatywny wpływ standaryzacji danych na działanie algorytmu na zbiorze abalone. Wynikać to może z faktu, że standaryzacja zmieniła  udział poszczególnych cech (jest ich, przypomnijmy, 8) w obliczaniu odległości.
+
+## Kinematics (mała liczba cech)
+
+```{r echo=FALSE}
+k <- 5
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./kinematics/p_", p, ".csv", sep=""), sep = ","))[3, ]
+benchmark_results2 <- as.matrix(read.csv(paste("./kinematics_standarized_data/p_", p, ".csv", sep=""), sep = ","))[3,]
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `knn()` z ustandaryzowanymi danymi:
+```{r}
+benchmark_results2
+```
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bagging <-  benchmark_results2
+names(normal) <- NULL
+names(bagging) <- NULL
+data <- data.frame(measures, normal, bagging)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'Zwykły algorytm knn') %>%
+            add_trace(y = ~bagging, name = 'Knn po standaryzacji zbioru X') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, p=2, k=5",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Różnice w miarach błędów są bardzo małe, wręcz zaniedbywalne.
+
+## Glass (umiarkowana liczba cech)
+
+```{r echo=FALSE}
+k <- 7
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./glass/p_", p, ".csv", sep=""), sep = ","))[4, ]
+benchmark_results2 <- as.matrix(read.csv(paste("./glass_standarized_data/p_", p, ".csv", sep=""), sep = ","))[4,]
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `knn()` z ustandaryzowanymi danymi:
+```{r}
+benchmark_results2
+```
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bagging <-  benchmark_results2
+names(normal) <- NULL
+names(bagging) <- NULL
+data <- data.frame(measures, normal, bagging)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'Zwykły algorytm knn') %>%
+            add_trace(y = ~bagging, name = 'Knn po standaryzacji zbioru X') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, p=2, k=7",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Więcej cech o większym rozrzucie to dobra ilustracja zalet standaryzacji - z wykresu jasno wynika, że wszystkie wskaźniki są niższe po takiej obróbce danych. Różnice sięgają 30%.
+
+## Skill (duża liczba cech)
+
+```{r echo=FALSE}
+k <- 15
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./skill/p_", p, ".csv", sep=""), sep = ","))[8, ]
+benchmark_results2 <- as.matrix(read.csv(paste("./skill_standarized_data/p_", p, ".csv", sep=""), sep = ","))[8,]
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `knn()` z ustandaryzowanymi danymi:
+```{r}
+benchmark_results2
+```
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bagging <-  benchmark_results2
+names(normal) <- NULL
+names(bagging) <- NULL
+data <- data.frame(measures, normal, bagging)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'Zwykły algorytm knn') %>%
+            add_trace(y = ~bagging, name = 'Knn po standaryzacji zbioru X') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, p=2, k=15",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Wszystkie wskaźniki są na podobnym poziomie, z niewielką przewagą wersji ze standaryzacją.
+
+## Wine Quality Red (jedna cecha dominująca)
+
+Jest to zbiór danych dotyczących czerwonego portugalskiego wina "Vinho Verde". Klasy wg źródła nie są zbalansowane, tzn. więcej jest win "normalnych" niż wybitnie dobrych lub bardzo słabych. Atrybuty to m.in. pH, alkohol i inne związki chemiczne wchodzące w skład wina. Należy zauważyć, że jeden z atrybutów-całkowita zawartość dwutlenku siarki-jest o rząd wielkości większy niż pozostałe. Daje to przesłanki by uważać, że standaryzacja danych poprawi działanie algorytmu.
+
+```{r echo=FALSE}
+k <- 15
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./winequality-red/p_", p, ".csv", sep=""), sep = ","))[8, ]
+benchmark_results2 <- as.matrix(read.csv(paste("./winequality-red_standarized_data/p_", p, ".csv", sep=""), sep = ","))[8,]
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `knn()` z ustandaryzowanymi danymi:
+```{r}
+benchmark_results2
+```
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bagging <-  benchmark_results2
+names(normal) <- NULL
+names(bagging) <- NULL
+data <- data.frame(measures, normal, bagging)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'Zwykły algorytm knn') %>%
+            add_trace(y = ~bagging, name = 'Knn po standaryzacji zbioru X') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, p=2, k=15",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Algorytm po standaryzacji daje znacznie lepsze rezultaty, zgodnie ze wstępnymi przewidywaniami. Wszystkie wskaźniki po ustandaryzowaniu zmalały o co najmniej kilkanaście procent.
+
+# Inne metody klasyfikacji
+
+## Algorytm lasów losowych
+
+Algorytm lasów losowych tworzy na zbiorze treningowym określoną przez użytkownika liczbę drzew klasyfikacyjnych. Aby zwiększyć przewagę lasu nad pojedynczym drzewem, pożądane jest zróżnicowanie (wariancja) drzew wchodzących w jego skład. Wariancja ta jest osiągana na następujące sposoby: 
+
+* Losowy wybór zbioru treningowego dla każdego drzewa. 
+* Losowy lub deterministyczny wybór zmiennych, na których dokonane zostaną cięcia (splits), zarówno dla całego drzewa jak i pojedynczego cięcia.
+* Losowy wybór metody cięcia dla każdego drzewa.
+* Losowe zróżnicowanie minimalnego rozmiaru węzła (w zadanych granicach) dla każdego drzewa. 
+
+Źródło: [algolytics.pl](http://algolytics.pl/wp-content/uploads/docs/pl/bk01pt04ch32s02.html)
+
+W 2002 roku wskazano na podobieństwo między algorytmem lasów losowych i knn. Oba budują modele na podstawie zbioru treningowego $\{(x_i, y_i)\}_{i=1}^n$, który przewiduje etykiety $\hat{y}$ dla nowych punktów $x'$ rozpatrując "sąsiedztwo" punktu, opisywane za pomocą funkcji wagowej $W$, przyjmującej wartości nieujemne:
+
+$$\hat{y} = \sum_{i=1}^{n}{W(x_i, x')y_i}$$
+$W(x_i, x')$ to waga $i-tego$ punktu względem nowego punktu $x'$. Dla każdego $x'$ wagi sumują się do zera.
+
+Dla algorytmu knn mamy: $W(x_i, x')=\frac{1}{k}$ gdy $x_i$ należy do $k$-najbliższych sąsiadów, 0 w przeciwnym wypadku.
+
+Dla drzew losowych: $W(x_i, x')=\frac{1}{k}$ gdy $x_i$ jest jednym z $k'$ punktów w tym samym liściu co $x'$, 0 w przeciwnym wypadku.
+
+Źródło: [wikipedia.org](https://en.wikipedia.org/wiki/Random_forest#Relationship_to_nearest_neighbors)
+
+Warto zwrócić uwagę, że funkcja `randomForest()` z biblioteki `randomForest` zwraca między innymi tzw. [tablicę pomyłek](https://en.wikipedia.org/wiki/Confusion_matrix), w której prosty sposób można odczytać relacje pomiędzy miarami pozytywnymi a negatywnymi, a więc błędy pierwszego i drugiego rodzaju.
+
+**UWAGA** Parametry $k$ oraz $p$ porównywanego algorytmu `knn()` wynoszą odpowiednio 15 i 2. Testowany zbiór danych to abalone.
+
+```{r echo=FALSE}
+k <- 15
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./abalone/p_", p, ".csv", sep=""), sep = ","))[8, ]
+benchmark_results2 <- as.matrix(read.csv("./abalone_random_forest/randomForest.csv", sep = ","))
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `randomForest()`
+```{r}
+benchmark_results2
+```
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+forest <-  benchmark_results2[1,]
+names(normal) <- NULL
+names(forest) <- NULL
+data <- data.frame(measures, normal, forest)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'knn, k=15, p=2') %>%
+            add_trace(y = ~forest, name = 'RandomForest') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Różnice w miarach błędów dla obu algorytmów są zaniedbywalne i mogą wynikać z losowości używanej zaówno w `randomForest()` jak i `knn()`.
+
+## Regresja logistyczna dla danych porządkowych
+Jest to metoda statystyczna dość odporna na zaszumienie danych i "overfitting". Ten algorytm klasyfikacyjny działa szczególnie dobrze, kiedy dane w rozpatrywanym problemie mają zależności w przybliżeniu liniowe, aczkolwiek możliwe są modyfikacje poprawiające wyniki dla nieliniowych danych.
+
+**UWAGA** Parametry $k$ oraz $p$ porównywanego algorytmu `knn()` wynoszą odpowiednio 15 i 2. Testowany zbiór danych to abalone.
+
+```{r echo=FALSE}
+k <- 15
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./abalone/p_", p, ".csv", sep=""), sep = ","))[8, ]
+benchmark_results2 <- as.matrix(read.csv("./abalone_polr/polr.csv", sep = ","))
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `polr()`
+```{r}
+benchmark_results2
+```
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+forest <-  benchmark_results2[1,]
+names(normal) <- NULL
+names(forest) <- NULL
+data <- data.frame(measures, normal, forest)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'knn, k=15, p=2') %>%
+            add_trace(y = ~forest, name = 'MASS::polr()') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Dla tego zbioru danych miary błędów obu algorytmów są podobne, ze wskazaniem na regresję liniową, której błąd średniokwadratowy jest kilka procent mniejszy niż $MSE$ algorytmu k-najbliższych sąsiadów. W porównaniu zbiorczym zaobserwować można większe różnice między tymi algorytmami (vide podrozdział z analizą zbioru Kinematics).
+
+## Inna metoda klasyfikacji dostępna w R
+Wybrałem metodę z pakietu `e1071` o nazwie `naiveBayesian`, która oblicza naiwny klasyfikator bayesowski.
+
+Naiwne klasyfikatory bayesowskie są oparte na założeniu o wzajemnej niezależności predyktorów (zmiennych niezależnych). Często nie mają one żadnego związku z rzeczywistością i właśnie z tego powodu nazywa się je naiwnymi. Ponadto model prawdopodobieństwa można wyprowadzić korzystając z twierdzenia Bayesa. Zaletą tego rodzaju klasyfikatorów jest duża szybkość w porównaniu do innych, bardziej zaawansowanych, metod. Ponadto jest on stosunkowo odporny na problem ["curse of dimensionality"](https://en.wikipedia.org/wiki/Curse_of_dimensionality).
+
+Źródła: [wikipedia.org](https://pl.wikipedia.org/wiki/Naiwny_klasyfikator_bayesowski), [scikit-learn.org](http://scikit-learn.org/stable/modules/naive_bayes.html)
+
+**UWAGA** Parametry $k$ oraz $p$ porównywanego algorytmu `knn()` wynoszą odpowiednio 15 i 2. Testowany zbiór danych to kinematics.
+
+```{r echo=FALSE}
+k <- 15
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./kinematics/p_", p, ".csv", sep=""), sep = ","))[8, ]
+benchmark_results2 <- as.matrix(read.csv("./kinematics_naive_bayesian/naive_bayesian.csv", sep = ","))
+```
+Wyniki dla `knn()`:
+```{r}
+benchmark_results1
+```
+Wyniki dla `naiveBayesian()`
+```{r}
+benchmark_results2
+```
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+forest <-  benchmark_results2[1,]
+names(normal) <- NULL
+names(forest) <- NULL
+data <- data.frame(measures, normal, forest)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'knn, k=15, p=2') %>%
+            add_trace(y = ~forest, name = 'e1071::naiveBayesian()') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+O ile różnice we wskaźniku $ERR$ sięgają kilkunastu procent (na korzyść k-najbliższych sąsiadów), to błąd średniokwadratowy naiwnego klasyfikatora Bayesowskiego jest 250% większy niż knn. Sugeruje to, że  `naiveBayesian()` popełnia podobną liczbę pomyłek co `knn()`, jednak są one znacznie "grubsze", tj. etykiety są znaczaco różne od oczekiwanych.
+
+## Zbiorcze porównanie powyższych metod
+
+### Kinematics
+
+**UWAGA** Parametry $k$ oraz $p$ porównywanego algorytmu `knn()` wynoszą odpowiednio 15 i 2.
+
+```{r echo=FALSE}
+k <- 15
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./kinematics/p_", p, ".csv", sep=""), sep = ","))[8, ]
+benchmark_results2 <- as.matrix(read.csv("./kinematics_naive_bayesian/naive_bayesian.csv", sep = ","))
+benchmark_results3 <- as.matrix(read.csv("./kinematics_polr/polr.csv", sep = ","))
+benchmark_results4 <- as.matrix(read.csv("./kinematics_random_forest/randomForest.csv", sep = ","))
+```
+
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bayesian <-  benchmark_results2[1,]
+polr <-  benchmark_results3[1,]
+forest <-  benchmark_results4[1,]
+names(normal) <- NULL
+names(bayesian) <- NULL
+names(polr) <- NULL
+names(forest) <- NULL
+data <- data.frame(measures, normal, bayesian, polr, forest)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'knn, k=15, p=2') %>%
+            add_trace(y = ~forest, name = 'randomForest::randomForest()') %>%
+            add_trace(y = ~polr, name = 'MASS::polr()') %>%
+            add_trace(y = ~bayesian, name = 'e1071::naiveBayesian()') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, zbiór Kinematics",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Przypomnijmy, że zbiór Kinematics zawiera dane silnie nieliniowe i zaszumione. Zgodnie z przewidywaniami teoretycznymi, z takimi danymi nie radzi sobie dobrze algorytm regresji logistycznej, który ma najwyższy odsetek błędów $ERR$. Jego błąd średniokwadratowy jest ponad dwukrotnie wyższy od algorytmu k-najbliższych sąsiadów, jednak znacznie niższy od naiwnego klasyfikatora bayesowskiego.
+
+### Abalone
+
+**UWAGA** Parametry $k$ oraz $p$ porównywanego algorytmu `knn()` wynoszą odpowiednio 15 i 2.
+
+```{r echo=FALSE}
+k <- 15
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./abalone/p_", p, ".csv", sep=""), sep = ","))[8, ]
+benchmark_results2 <- as.matrix(read.csv("./abalone_naive_bayesian/naive_bayesian.csv", sep = ","))
+benchmark_results3 <- as.matrix(read.csv("./abalone_polr/polr.csv", sep = ","))
+benchmark_results4 <- as.matrix(read.csv("./abalone_random_forest/randomForest.csv", sep = ","))
+```
+
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bayesian <-  benchmark_results2[1,]
+polr <-  benchmark_results3[1,]
+forest <-  benchmark_results4[1,]
+names(normal) <- NULL
+names(bayesian) <- NULL
+names(polr) <- NULL
+names(forest) <- NULL
+data <- data.frame(measures, normal, bayesian, polr, forest)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'knn, k=15, p=2') %>%
+            add_trace(y = ~forest, name = 'randomForest::randomForest()') %>%
+            add_trace(y = ~polr, name = 'MASS::polr()') %>%
+            add_trace(y = ~bayesian, name = 'e1071::naiveBayesian()') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, zbiór Abalone",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+W tym przypadku możemy zaobserwować, że trzy zaawansowane metody mają błędy na podobnym poziomie (różnice rzędu kilku procent, przykładowo $MSE$ dla `MASS::polr()` jest mniejszy od pozostałych o ok 5%). Odstającym klasyfikatorem jest naiwny klasyfikator bayesowski, a więc metoda znacznie prostsza od pozostałych. Wynika stąd, że w przypadku niezaszumionych danych do ich analizy warto wykorzystać taką z trzech metod, która daje wyniki w najkrótszym czasie lub jest najprostsza w implementacji.
+
+### Stock_ord
+Znalezienie dokładnych informacji o tym zbiorze danych okazało się problematyczne, jednak wydaje mi się, że zawiera on informacje o cenach akcji 9. firm aeronautycznych, na podstawie których klasyfikowana jest inna firma.
+
+**UWAGA** Parametry $k$ oraz $p$ porównywanego algorytmu `knn()` wynoszą odpowiednio 15 i 2.
+
+```{r echo=FALSE}
+k <- 15
+p <- 2
+benchmark_results1 <- as.matrix(read.csv(paste("./stock_ord/p_", p, ".csv", sep=""), sep = ","))[8, ]
+benchmark_results2 <- as.matrix(read.csv("./stock_ord_naive_bayesian/naive_bayesian.csv", sep = ","))
+benchmark_results3 <- as.matrix(read.csv("./stock_ord_polr/polr.csv", sep = ","))
+benchmark_results4 <- as.matrix(read.csv("./stock_ord_random_forest/randomForest.csv", sep = ","))
+```
+
+<center>
+```{r echo=FALSE}
+measures <- c("ERR", "MAD", "MSE")
+normal <- benchmark_results1
+bayesian <-  benchmark_results2[1,]
+polr <-  benchmark_results3[1,]
+forest <-  benchmark_results4[1,]
+names(normal) <- NULL
+names(bayesian) <- NULL
+names(polr) <- NULL
+names(forest) <- NULL
+data <- data.frame(measures, normal, bayesian, polr, forest)
+
+p <- config(plot_ly(data, x = ~measures, y = ~normal, type = 'bar', name = 'knn, k=15, p=2') %>%
+            add_trace(y = ~forest, name = 'randomForest::randomForest()') %>%
+            add_trace(y = ~polr, name = 'MASS::polr()') %>%
+            add_trace(y = ~bayesian, name = 'e1071::naiveBayesian()') %>%
+            layout(
+              yaxis = list(title = 'Wartość'), barmode = 'group',
+              title = "Miary błędów klasyfikacji, zbiór Stock_ord",
+              xaxis = list(title="Miara błędu")
+              ), displayModeBar=FALSE)
+p
+```
+</center>
+
+Zdecydowanie najlepszą metodą okazała się algorytm lasów losowych. Interesujący jest fakt, że metoda naiwnego klasyfikatora bayesowskiego popełniła mniej błędów niż bardziej zaawansowana funkcja polr (choć wskaźnik $MSE$ wskazuje nieznacznie na korzyść polr). Ponadto wszystkie trzy miary błędów metod knn i randomForest mają te same wartości.
+
+# Addendum - jak generowano wyniki
+Bazowa funkcja do kroswalidacji ma postać obsługującą knn i jego modyfikacje. z powodu różnej liczby argumentów, dla pozostałych klasyfikatorów zostały stworzone osobne funkcje, podobne do bazowej.
+```{r eval=FALSE}
+crossvalidation <- function(X, y, p, k, u=5, FUN, calculateMean = FALSE) 
+{
+  n <- nrow(X)
+  count <- n / u
+  indices <- sample(1:n, n)
+  sets <- split(indices, ceiling(seq_along(indices)/count))
+  err <- mad <- mse <- rep(0, u)
+  for(i in 1:u)
+  {
+    w <- FUN(X[-sets[[i]],], y[-sets[[i]]], X[sets[[i]],], k, p, calculateMean)
+    err[i] <- ERR(w, y[sets[[i]]])
+    mad[i] <- MAD(w, y[sets[[i]]])
+    mse[i] <- MSE(w, y[sets[[i]]])
+  }
+  
+  return(c(mean(err), mean(mad), mean(mse)))
+}
+```
+Zbiór indices to losowa permutacja indeksów elementów ze zbioru uczącego X. Na jego podstawie wyznaczanych jest 5 podzbiorów o podobnej długości, dla których wywoływana jest funkcja obliczająca etykiety.
+
+Podobna sytuacja miała miejsce z funkcją zapisującą wyniki w formacie csv. Jest ona przystosowana do wariacji `knn()`, a żeby obsłużyć pozostałe funkcje, powstały wyspecjalizowane funkcje pochodne od `generateCSV()`:
+
+```{r eval=FALSE}
+generateCSV <- function(datasetName, 
+                        FUN, 
+                        p = c(1, 2, Inf), 
+                        k = c(1,3,5,7,9,11,13,15,17,19), 
+                        folderNameSufix="", 
+                        standarize_data=FALSE,
+                        calculateMean = FALSE)
+{
+  source("utils.R")  # utils.R contains crossvalidation function
+
+  prefix <- "http://www.gagolewski.com/resources/data/ordinal-regression/"
+  sufix <- ".csv"
+  d <- as.matrix(read.csv(paste(prefix, datasetName, sufix, sep=""), sep = ","))
+  y <- factor(d[,1])
+  X <- d[, 2:ncol(d)]
+  
+  if(standarize_data)
+  {
+    X <- standarizeData(X)
+    folderNameSufix="_standarized_data"
+  }
+  if(calculateMean)  
+  {
+    folderNameSufix="_mean"
+  }
+  
+  catalog <- paste(datasetName, folderNameSufix, sep="")
+  unlink(catalog, recursive = TRUE)
+  dir.create(catalog)
+  
+  for (i in p)
+  {
+    # Prepare matrix:
+    data <- matrix(crossvalidation(X, y, i, 1, 5, FUN), nrow=1)
+    colnames(data) <- c("ERR", "MAD", "MSE")
+    
+    for (j in k[2:length(k)])
+    {
+      # Append new row:
+      row <- matrix(crossvalidation(X, y, i, j, 5, FUN), nrow=1)
+      data <- rbind(data, row)
+    }
+    
+    # Save to csv file:
+    write.csv(
+      data, 
+      file = paste(catalog, "/p_", i, sufix, sep=""),
+      row.names=FALSE, 
+      sep=",")
+  }
+}
+```
+Na początku pobierany jest zbiór danych określony przez użytkownika (odpowiednio modyfikowany, gdy użytkownik tego sobie zażyczy). Tworzony jest specjalny katalog, a następnie zapisywany wynik 5-krotnej kroswalidacji dla kolejnych wartości parametrów $k$, $p$. Tak otrzymana macierz zapisywana jest do pliku csv o ustalonej nazwie.
